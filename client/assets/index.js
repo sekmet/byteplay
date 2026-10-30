@@ -1572,3 +1572,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       console.error("There was a problem with the fetch operation:", error);
     });
 })();
+
+// Keep the inherited settings modal keyboard-dismissible until its forms
+// have passed parity review and the legacy DOM can be retired.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const modal = document.getElementById("settings-model");
+  if (!modal || modal.classList.contains("hidden")) return;
+  modal.classList.add("hidden");
+  document.getElementById("bp-settings")?.focus();
+});

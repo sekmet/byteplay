@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,12 +19,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"reflect"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"net/url"
@@ -31,7 +32,6 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/storage"
 	"golang.org/x/net/proxy"
 )
 
@@ -41,24 +41,33 @@ var (
 )
 
 type TorrentSession struct {
-	Client   *torrent.Client
-	Torrent  *torrent.Torrent
-	Port     int
-	LastUsed time.Time
-	ActiveStreams int32
-	ProbeMu       sync.Mutex
-	ProbeCache    map[int]*ProbeResult
+	Client      *torrent.Client
+	Torrent     *torrent.Torrent
+	Port        int
+	LastUsed    time.Time // guarded by lifecycleMu
+	lifecycleMu sync.Mutex
+	active      int
+	closing     bool
+	stopCtx     context.Context
+	stopCancel  context.CancelFunc
+	drained     chan struct{}
+	ProbeMu     sync.Mutex
+	ProbeCache  map[int]*ProbeResult
 }
 
 type ProbeStream struct {
-	Index    int    `json:"index"` // absolute ffmpeg stream index
-	Type     string `json:"type"`  // video | audio | subtitle
-	Codec    string `json:"codec"`
-	Profile  string `json:"profile,omitempty"`
-	Language string `json:"language,omitempty"`
-	Title    string `json:"title,omitempty"`
-	Channels int    `json:"channels,omitempty"`
-	Default  bool   `json:"default"`
+	Index       int     `json:"index"` // absolute ffmpeg stream index
+	Type        string  `json:"type"`  // video | audio | subtitle
+	Codec       string  `json:"codec"`
+	Profile     string  `json:"profile,omitempty"`
+	PixelFormat string  `json:"pixelFormat,omitempty"`
+	Width       int     `json:"width,omitempty"`
+	Height      int     `json:"height,omitempty"`
+	FrameRate   float64 `json:"frameRate,omitempty"`
+	Language    string  `json:"language,omitempty"`
+	Title       string  `json:"title,omitempty"`
+	Channels    int     `json:"channels,omitempty"`
+	Default     bool    `json:"default"`
 }
 
 type ProbeResult struct {
@@ -68,16 +77,18 @@ type ProbeResult struct {
 }
 
 type Settings struct {
-	EnableProxy    bool   `json:"enableProxy"`
-	ProxyURL       string `json:"proxyUrl"`
-	EnableProwlarr bool   `json:"enableProwlarr"`
-	ProwlarrHost   string `json:"prowlarrHost"`
-	ProwlarrApiKey string `json:"prowlarrApiKey"`
-	EnableJackett  bool   `json:"enableJackett"`
-	JackettHost    string `json:"jackettHost"`
-	JackettApiKey  string `json:"jackettApiKey"`
-	SearchTimeoutSeconds int  `json:"searchTimeoutSeconds"`
-	SkipTLSVerify        bool `json:"skipTlsVerify"`
+	EnableProxy          bool   `json:"enableProxy"`
+	ProxyURL             string `json:"proxyUrl"`
+	EnableProwlarr       bool   `json:"enableProwlarr"`
+	ProwlarrHost         string `json:"prowlarrHost"`
+	ProwlarrApiKey       string `json:"prowlarrApiKey"`
+	EnableJackett        bool   `json:"enableJackett"`
+	JackettHost          string `json:"jackettHost"`
+	JackettApiKey        string `json:"jackettApiKey"`
+	SearchTimeoutSeconds int    `json:"searchTimeoutSeconds"`
+	SkipTLSVerify        bool   `json:"skipTlsVerify"`
+	// Nil means an existing configuration uses the default 9 percent.
+	StartupCachePercent *int `json:"startupCachePercent"`
 }
 
 func searchTimeout() time.Duration {
@@ -147,13 +158,13 @@ func (b *ringLogBuffer) Lines() []string {
 var logBuffer = &ringLogBuffer{max: 500}
 
 var (
-	serverPort      = 3347
-	ffmpegPath      string
-	ffprobePath     string
-	ffmpegAvailable bool
-	ffmpegVersion   string
-	remuxSlots      chan struct{}
-	loopbackAuthHeader string
+	serverPort            = 3347
+	ffmpegPath            string
+	ffprobePath           string
+	ffmpegAvailable       bool
+	ffmpegVersion         string
+	remuxSlots            chan struct{}
+	loopbackInternalToken string
 )
 
 func checkFFmpeg() {
@@ -233,103 +244,97 @@ func formatSize(sizeInBytes float64) string {
 	return fmt.Sprintf("%.2f GB", sizeInGB)
 }
 
-var proxyTransport = &http.Transport{
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
-	IdleConnTimeout:       30 * time.Second,
-	MaxIdleConnsPerHost:   10,
-}
-
 // Basic auth for the whole app when BITPLAY_AUTH_USERNAME and
 // BITPLAY_AUTH_PASSWORD are both set; a no-op otherwise
 func basicAuthMiddleware(next http.Handler) http.Handler {
 	username := os.Getenv("BITPLAY_AUTH_USERNAME")
 	password := os.Getenv("BITPLAY_AUTH_PASSWORD")
-	if username == "" || password == "" {
+	if username == "" && password == "" {
 		return next
 	}
-
+	if username == "" || password == "" {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Authentication configuration incomplete", http.StatusServiceUnavailable)
+		})
+	}
+	var tokenBytes [32]byte
+	if _, err := crand.Read(tokenBytes[:]); err != nil {
+		log.Fatal("failed to establish internal loopback authentication")
+	}
+	loopbackInternalToken = hex.EncodeToString(tokenBytes[:])
 	userHash := sha256.Sum256([]byte(username))
 	passHash := sha256.Sum256([]byte(password))
-	loopbackAuthHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
-	log.Println("Basic authentication enabled (BITPLAY_AUTH_USERNAME/BITPLAY_AUTH_PASSWORD)")
-
+	log.Println("Basic authentication enabled")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLoopbackRequest(r) && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-BytePlay-Internal")), []byte(loopbackInternalToken)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
 		user, pass, ok := r.BasicAuth()
 		if ok {
 			uh := sha256.Sum256([]byte(user))
 			ph := sha256.Sum256([]byte(pass))
-			userMatch := subtle.ConstantTimeCompare(userHash[:], uh[:]) == 1
-			passMatch := subtle.ConstantTimeCompare(passHash[:], ph[:]) == 1
-			if userMatch && passMatch {
+			if subtle.ConstantTimeCompare(userHash[:], uh[:]) == 1 && subtle.ConstantTimeCompare(passHash[:], ph[:]) == 1 {
 				next.ServeHTTP(w, r)
 				return
 			}
 		}
-		w.Header().Set("WWW-Authenticate", `Basic realm="BitPlay", charset="UTF-8"`)
+		w.Header().Set("WWW-Authenticate", `Basic realm="BytePlay", charset="UTF-8"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	})
 }
 
-func copyHeadersOnRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("too many redirects")
-	}
-	for k, vv := range via[0].Header {
-		if _, ok := req.Header[k]; !ok {
-			req.Header[k] = vv
-		}
-	}
-	return nil
-}
-
+// Independent transports prevent proxy-setting races and state bleed.
 func createSelectiveProxyClient() *http.Client {
 	settingsMutex.RLock()
-	enableProxy := currentSettings.EnableProxy
-	proxyURL := currentSettings.ProxyURL
-	skipVerify := currentSettings.SkipTLSVerify
+	snapshot := currentSettings
 	settingsMutex.RUnlock()
-
-	timeout := searchTimeout()
-
-	var tlsConfig *tls.Config
-	if skipVerify {
-		tlsConfig = &tls.Config{InsecureSkipVerify: true}
+	timeout := time.Duration(snapshot.SearchTimeoutSeconds) * time.Second
+	if timeout <= 0 || timeout > 120*time.Second {
+		timeout = 30 * time.Second
 	}
-
-	if !enableProxy {
-		return &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-				IdleConnTimeout:       30 * time.Second,
-				MaxIdleConnsPerHost:   10,
-				TLSClientConfig:       tlsConfig,
-			},
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		MaxIdleConnsPerHost:   10,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: snapshot.SkipTLSVerify},
+	}
+	if snapshot.EnableProxy {
+		dialer, err := createProxyDialer(snapshot.ProxyURL)
+		if err != nil {
+			return &http.Client{Timeout: timeout, Transport: errorTransport{}}
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if d, ok := dialer.(proxy.ContextDialer); ok {
+				return d.DialContext(ctx, network, addr)
+			}
+			return dialer.Dial(network, addr)
 		}
 	}
-	// Reconfigure proxyTransport’s DialContext if URL changed:
-	dialer, _ := createProxyDialer(proxyURL)
-	proxyTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialer.Dial(network, addr)
-	}
-	proxyTransport.TLSClientConfig = tlsConfig
-	// Drop any old idle conns after reconfiguration:
-	proxyTransport.CloseIdleConnections()
-
 	return &http.Client{
-		Transport:     proxyTransport,
-		Timeout:       timeout,
-		CheckRedirect: copyHeadersOnRedirect,
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 || len(via) == 0 || !sameOrigin(req.URL, via[0].URL) {
+				return errors.New("cross-origin redirect denied")
+			}
+			return nil
+		},
 	}
+}
+
+type errorTransport struct{}
+
+func (errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("invalid SOCKS5 proxy configuration")
 }
 
 // Create a proxy dialer for SOCKS5
 func createProxyDialer(proxyURL string) (proxy.Dialer, error) {
 	proxyURLParsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse proxy URL: %v", err)
+	if err != nil || proxyURLParsed.Scheme != "socks5" || proxyURLParsed.Host == "" {
+		return nil, errors.New("invalid SOCKS5 proxy URL")
 	}
 
 	// Extract auth information
@@ -383,21 +388,16 @@ func initTorrentWithProxy() (*torrent.Client, int, error) {
 	settingsMutex.RUnlock()
 
 	config := torrent.NewDefaultClientConfig()
-	config.DefaultStorage = storage.NewFile("./torrent-data")
+	config.DefaultStorage = newBudgetTorrentStorage("./torrent-data", activeHLS)
 	port := getAvailablePort()
 	config.ListenPort = port
 
 	if enableProxy {
 		log.Println("Creating torrent client with proxy...")
-		os.Setenv("ALL_PROXY", proxyURL)
-		os.Setenv("SOCKS_PROXY", proxyURL)
-		os.Setenv("HTTP_PROXY", proxyURL)
-		os.Setenv("HTTPS_PROXY", proxyURL)
-
-		proxyDialer, err := createProxyDialer(proxyURL)
+		_, err := createProxyDialer(proxyURL)
 		if err != nil {
 			releasePort(port)
-			return nil, port, fmt.Errorf("could not create proxy dialer: %v", err)
+			return nil, port, errors.New("invalid SOCKS5 proxy configuration")
 		}
 
 		config.HTTPProxy = func(*http.Request) (*url.URL, error) {
@@ -410,44 +410,20 @@ func initTorrentWithProxy() (*torrent.Client, int, error) {
 			return nil, port, err
 		}
 
-		setValue(client, "dialerNetwork", func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return proxyDialer.Dial(network, addr)
-		})
+		// This config forwards supported HTTP requests. SOCKS5 peer/tracker
+		// isolation has not been established; do not claim VPN-grade egress.
+		log.Println("SOCKS5 configured for supported HTTP traffic; torrent peer isolation is not certified")
 
 		return client, port, nil
 	}
 
 	log.Println("Creating torrent client without proxy...")
-	os.Unsetenv("ALL_PROXY")
-	os.Unsetenv("SOCKS_PROXY")
-	os.Unsetenv("HTTP_PROXY")
-	os.Unsetenv("HTTPS_PROXY")
-
 	client, err := torrent.NewClient(config)
 	if err != nil {
 		releasePort(port)
 		return nil, port, err
 	}
 	return client, port, nil
-}
-
-// Helper function to try to set a field value using reflection
-// This is a bit hacky but might help override the client's dialer
-func setValue(obj interface{}, fieldName string, value interface{}) {
-	// This is a best-effort approach that may not work with all library versions
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Warning: Could not set %s field: %v", fieldName, r)
-		}
-	}()
-
-	reflectValue := reflect.ValueOf(obj).Elem()
-	field := reflectValue.FieldByName(fieldName)
-
-	if field.IsValid() && field.CanSet() {
-		field.Set(reflect.ValueOf(value))
-		log.Printf("Successfully set %s to use proxy", fieldName)
-	}
 }
 
 // Override system settings with our proxy
@@ -457,20 +433,21 @@ func init() {
 	if _, err := os.Stat("config/settings.json"); os.IsNotExist(err) {
 		log.Println("settings.json not found, creating default settings")
 		defaultSettings := Settings{
-			EnableProxy:    false,
-			ProxyURL:       "",
-			EnableProwlarr: false,
-			ProwlarrHost:   "",
-			ProwlarrApiKey: "",
-			EnableJackett:  false,
-			JackettHost:    "",
-			JackettApiKey:  "",
+			EnableProxy:         false,
+			ProxyURL:            "",
+			EnableProwlarr:      false,
+			ProwlarrHost:        "",
+			ProwlarrApiKey:      "",
+			EnableJackett:       false,
+			StartupCachePercent: startupCachePercentPtr(defaultStartupCachePercent),
+			JackettHost:         "",
+			JackettApiKey:       "",
 		}
 		// Create the config directory if it doesn't exist
-		if err := os.MkdirAll("config", 0755); err != nil {
+		if err := os.MkdirAll("config", 0700); err != nil {
 			log.Fatalf("Failed to create config directory: %v", err)
 		}
-		settingsFile, err := os.Create("config/settings.json")
+		settingsFile, err := os.OpenFile("config/settings.json", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			log.Fatalf("Failed to create settings.json: %v", err)
 		}
@@ -504,34 +481,25 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, logBuffer))
 
 	checkFFmpeg()
-
-	// Seed random number generator
-	rand.Seed(time.Now().UnixNano())
-
-	// Force proxy for all Go HTTP connections
-	setGlobalProxy()
+	activeHLS.ffmpeg = ffmpegPath
+	// Own the cache for the entire process lifetime. Without this lock a
+	// second instance could delete an active HLS generation at startup.
+	ownership, err := acquireHLSCacheOwnership(activeHLS.root)
+	if err != nil {
+		log.Fatalf("HLS cache ownership: %v", err)
+	}
+	defer ownership.Close()
+	// No playback worker can exist before serving requests. Purge only
+	// verified, internally named HLS outputs from an interrupted prior run.
+	if err := activeHLS.recoverAbandonedCache(); err != nil {
+		log.Fatalf("HLS startup recovery: %v", err)
+	}
 
 	// Set up endpoint handlers
 	http.HandleFunc("/api/v1/torrent/add", addTorrentHandler)
 	http.HandleFunc("/api/v1/torrent/", torrentHandler)
-	http.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			settingsMutex.RLock()
-			snapshot := currentSettings
-			settingsMutex.RUnlock()
-
-			resp := struct {
-				Settings
-				ProwlarrApiKeySet bool `json:"prowlarrApiKeySet"`
-				JackettApiKeySet  bool `json:"jackettApiKeySet"`
-			}{snapshot, snapshot.ProwlarrApiKey != "", snapshot.JackettApiKey != ""}
-			resp.ProwlarrApiKey = ""
-			resp.JackettApiKey = ""
-			respondWithJSON(w, http.StatusOK, resp)
-		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
+	http.HandleFunc("/api/v1/settings", settingsHandler)
+	http.HandleFunc("/api/v1/settings/playback", playbackSettingsHandler)
 	http.HandleFunc("/api/v1/settings/proxy", saveProxySettingsHandler)
 	http.HandleFunc("/api/v1/settings/prowlarr", saveProwlarrSettingsHandler)
 	http.HandleFunc("/api/v1/settings/jackett", saveJackettSettingsHandler)
@@ -545,6 +513,8 @@ func main() {
 	http.HandleFunc("/api/v1/sessions", sessionsHandler)
 	http.HandleFunc("/api/v1/cache/purge", purgeCacheHandler)
 	http.HandleFunc("/api/v1/capabilities", capabilitiesHandler)
+	http.HandleFunc("/healthz", healthzHandler)
+	http.HandleFunc("/api/v1/hls/", activeHLS.handler)
 
 	// Set up client file serving
 	// no-cache: revalidate on every load so updates aren't stuck behind stale assets
@@ -559,226 +529,151 @@ func main() {
 		http.ServeFile(w, r, "./client/favicon.ico")
 	})
 
-	go cleanupSessions()
-
-	addr := fmt.Sprintf(":%d", serverPort)
+	host := os.Getenv("BITPLAY_LISTEN_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if err := validateListenHost(host, os.Getenv("BITPLAY_AUTH_USERNAME"), os.Getenv("BITPLAY_AUTH_PASSWORD"), os.Getenv("BITPLAY_ALLOW_UNAUTHENTICATED_LAN") == "1"); err != nil {
+		log.Fatal(err)
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(serverPort))
 	log.Printf("Attempting to start server on %s", addr)
-
-	// Create channel to signal if server started successfully
-	serverStarted := make(chan bool, 1)
-
-	// Create a server with graceful shutdown
-	server := &http.Server{
-		Addr: addr,
-		Handler: basicAuthMiddleware(http.DefaultServeMux),
+	if os.Getenv("BITPLAY_ALLOW_UNAUTHENTICATED_LAN") == "1" {
+		log.Println("WARNING: unauthenticated LAN access explicitly permitted; do not expose to the internet")
 	}
 
-	// Start the server in a goroutine
-	go func() {
-		err := server.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
-			log.Printf("Server failed on %s: %v", addr, err)
-			serverStarted <- false
-		}
-	}()
-
-	// Give the server a moment to start or fail
-	select {
-	case success := <-serverStarted:
-		if !success {
-			log.Printf("Server failed to start on %s", addr)
-			return
-		}
-	case <-time.After(1 * time.Second):
-		// No immediate error, assume it started successfully
-		log.Printf("🚀 Server successfully started on %s", addr)
-
-		// Create a simple message to display in the browser
-		fmt.Printf("\n------------------------------------------------\n")
-		fmt.Printf("✅ Server started! Open in your browser:\n")
-		fmt.Printf("   http://localhost:%d\n", serverPort)
-		fmt.Printf("------------------------------------------------\n\n")
-
-		// Block forever (the server is running in a goroutine)
-		select {}
-	}
-}
-
-// Set up global proxy for all Go HTTP calls
-func setGlobalProxy() {
-	settingsMutex.RLock()
-	enableProxy := currentSettings.EnableProxy
-	proxyURL := currentSettings.ProxyURL
-	settingsMutex.RUnlock()
-
-	if !enableProxy {
-		log.Println("Proxy is disabled, not setting global HTTP proxy.")
-		return
-	}
-
-	proxyDialer, err := createProxyDialer(proxyURL)
+	// Bind synchronously so startup failures are not mistaken for a live server.
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("Warning: Could not create proxy dialer: %v", err)
+		log.Printf("Failed to bind %s: %v", addr, err)
 		return
 	}
-
-	httpTransport, ok := http.DefaultTransport.(*http.Transport)
-	if ok {
-		httpTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return proxyDialer.Dial(network, addr)
+	server := &http.Server{
+		Handler:           basicAuthMiddleware(http.DefaultServeMux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go cleanupSessions(ctx)
+	go activeHLS.sweepLoop(ctx)
+	log.Printf("BytePlay listening at %s", listener.Addr())
+	if err := serveWithShutdown(ctx, server, listener, 15*time.Second); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+	}
+	activeHLS.stopAll(10 * time.Second)
+	// Stop admitting work, then close all sessions that have drained. If any
+	// reader survived forced connection shutdown, retain its cache rather than
+	// deleting files under it.
+	if retired, ok := drainIdleSessionRegistry(); ok {
+		for _, session := range retired {
+			closeTorrentClient(session)
 		}
-		log.Printf("Successfully configured SOCKS5 proxy for all HTTP traffic: %s", proxyURL)
+		finishSessionPurge()
 	} else {
-		log.Println("⚠️ Warning: Could not override HTTP transport")
+		log.Println("Some torrent operations are still active; cache preserved during shutdown")
 	}
 }
 
 // Handler to add a torrent using a magnet link
 func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	var request struct{ Magnet string }
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			respondWithJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "Torrent input exceeds 16 KB"})
+			return
+		}
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
 		return
 	}
 
-	magnet := html.UnescapeString(request.Magnet)
+	magnet := strings.TrimSpace(html.UnescapeString(request.Magnet))
 	if magnet == "" {
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "No magnet link provided"})
+		return
 	}
 
-	// handle http links like Prowlarr or Jackett
-	if strings.HasPrefix(request.Magnet, "http") {
-		// Use the client that bypasses proxy for Prowlarr
-		httpClient := createSelectiveProxyClient()
-
-		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-
-		// Make the HTTP request to follow the Prowlarr link
-		req, err := http.NewRequest("GET", request.Magnet, nil)
+	// Only enabled, configured indexer origins can supply torrent metadata.
+	if strings.HasPrefix(magnet, "http://") || strings.HasPrefix(magnet, "https://") {
+		settingsMutex.RLock()
+		snapshot := currentSettings
+		settingsMutex.RUnlock()
+		resolved, err := fetchIndexerMagnet(r.Context(), magnet, snapshot, createSelectiveProxyClient())
 		if err != nil {
-			log.Printf("Error creating request: %v", err)
-			respondWithJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Invalid URL: " + err.Error(),
-			})
+			respondWithJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Torrent URL is not an allowed or reachable indexer download"})
 			return
 		}
-
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-		// Follow the Prowlarr link
-		log.Printf("Following Prowlarr URL: %s", request.Magnet)
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			log.Printf("Error following URL: %v", err)
-			respondWithJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Failed to download: " + err.Error(),
-			})
-			return
-		}
-		defer resp.Body.Close()
-
-		log.Printf("Got response: %d %s", resp.StatusCode, resp.Status)
-
-		// Check for redirects to magnet links
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			location := resp.Header.Get("Location")
-			log.Printf("Found redirect to: %s", location)
-
-			if strings.HasPrefix(location, "magnet:") {
-				log.Printf("Found magnet redirect: %s", location)
-				magnet = location
-			} else {
-				log.Printf("Non-magnet redirect: %s", location)
-				respondWithJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "URL redirects to non-magnet content",
-				})
-				return
-			}
-		}
+		magnet = resolved
 	}
+	normalized, err := normalizeMagnetInput(magnet)
+	if err != nil {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet link or infohash"})
+		return
+	}
+	magnet = normalized
 
-	// check if magnet link is valid
-	if magnet == "" || !strings.HasPrefix(magnet, "magnet:") {
+	parsed, err := metainfo.ParseMagnetUri(magnet)
+	if err != nil {
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet link"})
 		return
 	}
-
-	// Reuse a live session for the same infohash instead of spinning up a
-	// second client and re-fetching metadata
-	if m, err := metainfo.ParseMagnetUri(magnet); err == nil {
-		if existing, ok := sessions.Load(m.InfoHash.HexString()); ok {
-			session := existing.(*TorrentSession)
-			session.LastUsed = time.Now()
-			log.Printf("Reusing session: %s", m.InfoHash.HexString())
-			respondWithJSON(w, http.StatusOK, map[string]string{"sessionId": m.InfoHash.HexString()})
-			return
+	sessionID := parsed.InfoHash.HexString()
+	_, err = getOrCreateTorrentSession(r.Context(), sessionID, func(ctx context.Context) (*TorrentSession, error) {
+		client, port, err := initTorrentWithProxy()
+		if err != nil {
+			return nil, &sessionAddError{http.StatusInternalServerError, "Failed to initialize torrent client"}
 		}
-	}
-
-	// Use the simpler, more secure proxy configuration
-	client, port, err := initTorrentWithProxy()
-	if err != nil {
-		log.Printf("Client creation error: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError,
-			map[string]string{"error": "Failed to create client with proxy"})
-		return
-	}
-
-	// if we bail out before session‑storage, make sure to release both client & port
-	defer func() {
-		if client != nil {
-			releasePort(port)
-			client.Close()
+		defer func() {
+			if client != nil {
+				releasePort(port)
+				client.Close()
+			}
+		}()
+		t, err := client.AddMagnet(magnet)
+		if err != nil {
+			return nil, &sessionAddError{http.StatusBadRequest, "Invalid magnet link"}
 		}
-	}()
-
-	t, err := client.AddMagnet(magnet)
-	if err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet url"})
-		return
-	}
-	log.Printf("Torrent added: %s", t.InfoHash().HexString())
-
-	select {
-	case <-t.GotInfo():
-		log.Printf("Successfully got torrent info for %s", t.InfoHash().HexString())
-	case <-time.After(3 * time.Minute):
-		respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "Timeout getting info - proxy might be blocking BitTorrent traffic"})
-		return
-	}
-
-	sessionID := t.InfoHash().HexString()
-	log.Printf("Creating new session with ID: %s", sessionID)
-	sessions.Store(sessionID, &TorrentSession{
-		Client:     client,
-		Torrent:    t,
-		Port:       port,
-		LastUsed:   time.Now(),
-		ProbeCache: map[int]*ProbeResult{},
+		timer := time.NewTimer(3 * time.Minute)
+		defer timer.Stop()
+		select {
+		case <-t.GotInfo():
+		case <-ctx.Done():
+			return nil, &sessionAddError{http.StatusRequestTimeout, "Torrent request cancelled"}
+		case <-timer.C:
+			return nil, &sessionAddError{http.StatusGatewayTimeout, "Timeout fetching torrent metadata"}
+		}
+		created := &TorrentSession{
+			Client:     client,
+			Torrent:    t,
+			Port:       port,
+			LastUsed:   time.Now(),
+			ProbeCache: map[int]*ProbeResult{},
+		}
+		client = nil // the registry now owns this client
+		return created, nil
 	})
-
-	// Log successful storage
-	log.Printf("Successfully stored session: %s", sessionID)
-
-	// Set client to nil so it doesn't get closed by the defer function
-	// since it's now stored in the sessions map
-	client = nil
-
+	if err != nil {
+		var addErr *sessionAddError
+		if errors.As(err, &addErr) {
+			respondWithJSON(w, addErr.status, map[string]string{"error": addErr.message})
+		} else {
+			respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Torrent session unavailable"})
+		}
+		return
+	}
 	respondWithJSON(w, http.StatusOK, map[string]string{"sessionId": sessionID})
 }
 
 // Torrent handler to serve torrent files and stream content
 func torrentHandler(w http.ResponseWriter, r *http.Request) {
-	// Log the entire URL path for debugging
-	log.Printf("Torrent handler called with path: %s", r.URL.Path)
 
 	// Extract sessionId and possibly fileIndex from the URL
 	parts := strings.Split(r.URL.Path, "/")
-
-	// Debug the path parts
-	log.Printf("Path parts: %v (length: %d)", parts, len(parts))
 
 	// The URL structure is /api/v1/torrent/[sessionId]/...
 	if len(parts) < 5 { // Changed from 4 to 5
@@ -790,34 +685,16 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 	// The session ID is at position 4, not 3 (because array is 0-indexed and path starts with /)
 	sessionID := parts[4] // Changed from parts[3] to parts[4]
 
-	log.Printf("Looking for session with ID: %s", sessionID)
-
-	// Debug: Print all sessions that we have
-	var sessionKeys []string
-	sessions.Range(func(key, value interface{}) bool {
-		keyStr, ok := key.(string)
-		if ok {
-			sessionKeys = append(sessionKeys, keyStr)
-		}
-		return true
-	})
-	log.Printf("Available sessions: %v", sessionKeys)
-
-	// Get the torrent session from our sessions map
-	sessionValue, ok := sessions.Load(sessionID)
+	// Acquire and retain atomically with cleanup; a live request cannot be reaped.
+	session, ok := retainTorrentSession(sessionID, true)
 	if !ok {
-		log.Printf("Session not found with ID: %s", sessionID)
-		respondWithJSON(w, http.StatusNotFound, map[string]string{
-			"error":              "Session not found",
-			"id":                 sessionID,
-			"available_sessions": strings.Join(sessionKeys, ", "),
-		})
+		respondWithJSON(w, http.StatusNotFound, map[string]string{"error": "Session not found"})
 		return
 	}
-
-	log.Printf("Found session with ID: %s", sessionID)
-	session := sessionValue.(*TorrentSession)
-	session.LastUsed = time.Now() // Update last used time
+	defer releaseTorrentSession(session)
+	ownedCtx, stopOwned := sessionRequestContext(session, r.Context())
+	defer stopOwned()
+	r = r.WithContext(ownedCtx)
 
 	// Files() panics if metadata never arrived
 	if session.Torrent.Info() == nil {
@@ -887,6 +764,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 
 				// Read the SRT file with size limit
 				reader := file.NewReader()
+				reader.SetContext(r.Context())
 				defer reader.Close()
 				// Wrap with limiting reader to prevent memory issues (10MB max)
 				limitReader := io.LimitReader(reader, 10*1024*1024) // 10MB limit for subtitles
@@ -911,19 +789,22 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 		}
 
-		// Stream the file
-		reader := file.NewReader()
+		// Read only the selected file's needed pieces with 16 MiB readahead.
+		source, err := newMediaSource(session.Torrent, fileIndex)
+		if err != nil {
+			http.Error(w, "Invalid file index", http.StatusBadRequest)
+			return
+		}
+		reader := source.Open(r.Context())
 		// ServeContent will close the reader when done but we need to
 		// ensure it gets closed if there's a panic or other error
-		defer func() {
-			if closer, ok := reader.(io.Closer); ok {
-				closer.Close()
-			}
-		}()
-		// keep the session off the idle GC while this response is open
-		atomic.AddInt32(&session.ActiveStreams, 1)
-		defer atomic.AddInt32(&session.ActiveStreams, -1)
+		defer reader.Close()
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
+		progress := reader.Progress()
+		if progress.FirstByteLatencyMillis != nil {
+			log.Printf("Media source file_index=%d first_byte_ms=%d bytes_served=%d selected_completed=%d torrent_completed=%d",
+				fileIndex, *progress.FirstByteLatencyMillis, progress.BytesServed, progress.FileBytesCompleted, progress.TorrentBytesCompleted)
+		}
 		return
 	}
 
@@ -931,9 +812,10 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 	var files []map[string]interface{}
 	for i, file := range session.Torrent.Files() {
 		files = append(files, map[string]interface{}{
-			"index": i,
-			"name":  file.DisplayPath(),
-			"size":  file.Length(),
+			"index":          i,
+			"name":           file.DisplayPath(),
+			"size":           file.Length(),
+			"bytesCompleted": file.BytesCompleted(),
 		})
 	}
 
@@ -981,29 +863,19 @@ func respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// Update cleanupSessions with safer reflection
-func cleanupSessions() {
+// Retire only sessions that have been idle for the complete TTL and have no
+// retained requests. The registry lock prevents a concurrent retain/close race.
+func cleanupSessions(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-
-	for range ticker.C {
-		log.Printf("Checking for unused sessions...")
-		sessions.Range(func(key, value interface{}) bool {
-			session := value.(*TorrentSession)
-
-			// never reap a session with an open stream response
-			if atomic.LoadInt32(&session.ActiveStreams) > 0 {
-				session.LastUsed = time.Now()
-				return true
-			}
-
-			if time.Since(session.LastUsed) > 15*time.Minute {
-				teardownSession(key, session)
-				log.Printf("Removed unused session: %s", key)
-			}
-			return true
-		})
-		runtime.GC()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reapInactiveSessions(time.Now(), 15*time.Minute)
+			runtime.GC()
+		}
 	}
 }
 
@@ -1014,8 +886,8 @@ func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
 
 	args := []string{"-v", "error", "-of", "json", "-show_format", "-show_streams",
 		"-probesize", "16M", "-analyzeduration", "20M"}
-	if loopbackAuthHeader != "" {
-		args = append(args, "-headers", "Authorization: "+loopbackAuthHeader+"\r\n")
+	if loopbackInternalToken != "" {
+		args = append(args, "-headers", "X-BytePlay-Internal: "+loopbackInternalToken+"\r\n")
 	}
 	args = append(args, streamURL)
 
@@ -1037,13 +909,17 @@ func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
 			Duration   string `json:"duration"`
 		} `json:"format"`
 		Streams []struct {
-			Index       int               `json:"index"`
-			CodecType   string            `json:"codec_type"`
-			CodecName   string            `json:"codec_name"`
-			Profile     string            `json:"profile"`
-			Channels    int               `json:"channels"`
-			Tags        map[string]string `json:"tags"`
-			Disposition struct {
+			Index        int               `json:"index"`
+			CodecType    string            `json:"codec_type"`
+			CodecName    string            `json:"codec_name"`
+			Profile      string            `json:"profile"`
+			PixelFormat  string            `json:"pix_fmt"`
+			Width        int               `json:"width"`
+			Height       int               `json:"height"`
+			AvgFrameRate string            `json:"avg_frame_rate"`
+			Channels     int               `json:"channels"`
+			Tags         map[string]string `json:"tags"`
+			Disposition  struct {
 				Default int `json:"default"`
 			} `json:"disposition"`
 		} `json:"streams"`
@@ -1056,12 +932,16 @@ func runFFprobe(ctx context.Context, streamURL string) (*ProbeResult, error) {
 	result.Duration, _ = strconv.ParseFloat(raw.Format.Duration, 64)
 	for _, s := range raw.Streams {
 		ps := ProbeStream{
-			Index:    s.Index,
-			Type:     s.CodecType,
-			Codec:    s.CodecName,
-			Profile:  s.Profile,
-			Channels: s.Channels,
-			Default:  s.Disposition.Default == 1,
+			Index:       s.Index,
+			Type:        s.CodecType,
+			Codec:       s.CodecName,
+			Profile:     s.Profile,
+			PixelFormat: s.PixelFormat,
+			Width:       s.Width,
+			Height:      s.Height,
+			FrameRate:   parseMediaFrameRate(s.AvgFrameRate),
+			Channels:    s.Channels,
+			Default:     s.Disposition.Default == 1,
 		}
 		if s.Tags != nil {
 			ps.Language = s.Tags["language"]
@@ -1147,16 +1027,13 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 		}
 	}
 
-	select {
-	case remuxSlots <- struct{}{}:
-		defer func() { <-remuxSlots }()
-	default:
+	// Legacy remux and HLS share the bounded FFmpeg process budget.
+	releaseFFmpeg, admitted := reserveLegacyRemuxSlot(remuxSlots, activeHLS.processSlots)
+	if !admitted {
 		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Too many active streams - try again shortly"})
 		return
 	}
-
-	atomic.AddInt32(&session.ActiveStreams, 1)
-	defer atomic.AddInt32(&session.ActiveStreams, -1)
+	defer releaseFFmpeg()
 
 	videoCodec := ""
 	session.ProbeMu.Lock()
@@ -1171,8 +1048,8 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	session.ProbeMu.Unlock()
 
 	args := []string{"-v", "error"}
-	if loopbackAuthHeader != "" {
-		args = append(args, "-headers", "Authorization: "+loopbackAuthHeader+"\r\n")
+	if loopbackInternalToken != "" {
+		args = append(args, "-headers", "X-BytePlay-Internal: "+loopbackInternalToken+"\r\n")
 	}
 	if startSeconds > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
@@ -1219,17 +1096,6 @@ func handleRemux(w http.ResponseWriter, r *http.Request, session *TorrentSession
 	}
 }
 
-func teardownSession(key interface{}, session *TorrentSession) {
-	releasePort(session.Port)
-	if session.Torrent != nil {
-		session.Torrent.Drop()
-	}
-	if session.Client != nil {
-		session.Client.Close()
-	}
-	sessions.Delete(key)
-}
-
 func logsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1246,13 +1112,14 @@ func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	list := []map[string]interface{}{}
 	sessions.Range(func(key, value interface{}) bool {
-		session := value.(*TorrentSession)
+		id := key.(string)
+		session, ok := retainTorrentSession(id, false)
+		if !ok {
+			return true
+		}
 		entry := map[string]interface{}{
-			"id":       key,
-			"name":     "(fetching metadata)",
-			"size":     int64(0),
-			"complete": int64(0),
-			"peers":    0,
+			"id": id, "name": "(fetching metadata)",
+			"size": int64(0), "complete": int64(0), "peers": 0,
 		}
 		if t := session.Torrent; t != nil && t.Info() != nil {
 			stats := t.Stats()
@@ -1261,6 +1128,7 @@ func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 			entry["complete"] = t.BytesCompleted()
 			entry["peers"] = stats.ActivePeers
 		}
+		releaseTorrentSession(session)
 		list = append(list, entry)
 		return true
 	})
@@ -1285,11 +1153,38 @@ func purgeCacheHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions.Range(func(key, value interface{}) bool {
-		teardownSession(key, value.(*TorrentSession))
-		log.Printf("Purged session: %s", key)
-		return true
-	})
+	// Cancel owned media operations and wait for every retained reader.
+	// Never delete cached files beneath a live stream or FFmpeg child.
+	retired, drained, ok := beginCancellingSessionPurge()
+	if !ok {
+		respondWithJSON(w, http.StatusConflict, map[string]string{"error": "Torrent metadata fetch or another purge is active"})
+		return
+	}
+	finishOnReturn := true
+	defer func() {
+		if finishOnReturn {
+			finishSessionPurge()
+		}
+	}()
+	waitCtx, cancelWait := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancelWait()
+	if err := waitForDrainedSessions(waitCtx, drained); err != nil {
+		// Preserve cache. Hold the purge gate until all remaining readers
+		// release and the associated torrent clients can close safely.
+		finishOnReturn = false
+		go func() {
+			_ = waitForDrainedSessions(context.Background(), drained)
+			for _, session := range retired {
+				closeTorrentClient(session)
+			}
+			finishSessionPurge()
+		}()
+		respondWithJSON(w, http.StatusConflict, map[string]string{"error": "Torrent sessions still draining; cache preserved"})
+		return
+	}
+	for _, session := range retired {
+		closeTorrentClient(session)
+	}
 
 	const dataDir = "./torrent-data"
 	freed := dirSize(dataDir)
@@ -1305,6 +1200,9 @@ func purgeCacheHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Every torrent writer was drained by the purge gate. Discard projected
+	// mmap file lengths only after all persistent data was removed.
+	activeHLS.resetTorrentProjections()
 
 	log.Printf("Cache purged, freed %s", formatSize(float64(freed)))
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -1326,8 +1224,7 @@ func testProwlarrConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var settings ProwlarrSettings
-	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &settings) {
 		return
 	}
 
@@ -1351,16 +1248,15 @@ func testProwlarrConnection(w http.ResponseWriter, r *http.Request) {
 
 	req, err := http.NewRequest("GET", testURL, nil)
 	if err != nil {
-		log.Printf("Error creating request: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to prepare Prowlarr test request"})
 		return
 	}
 
 	req.Header.Set("X-Api-Key", prowlarrApiKey)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error making request to Prowlarr: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to connect to Prowlarr: " + err.Error()})
+		log.Println("Prowlarr connection test failed")
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to connect to Prowlarr"})
 		return
 	}
 	defer resp.Body.Close()
@@ -1370,10 +1266,9 @@ func testProwlarrConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Error reading response: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read Prowlarr response"})
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(responseBody) > 1<<20 {
+		respondWithJSON(w, http.StatusBadGateway, map[string]string{"error": "Prowlarr status response unavailable or too large"})
 		return
 	}
 
@@ -1534,8 +1429,7 @@ func testJackettConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var settings JackettSettings
-	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &settings) {
 		return
 	}
 
@@ -1564,8 +1458,8 @@ func testJackettConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error making request to Jackett: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to connect to Jackett: " + err.Error()})
+		log.Println("Jackett connection test failed")
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to connect to Jackett"})
 		return
 	}
 	defer resp.Body.Close()
@@ -1744,8 +1638,7 @@ func testProxyConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var settings ProxySettings
-	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &settings) {
 		return
 	}
 
@@ -1756,10 +1649,14 @@ func testProxyConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the proxy URL
+	// Proxy credentials are never reflected into diagnostics.
 	parsedProxyURL, err := url.Parse(proxyURL)
-	if err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid proxy URL: " + err.Error()})
+	if err != nil || parsedProxyURL == nil {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid SOCKS5 proxy configuration"})
+		return
+	}
+	if _, err := createProxyDialer(proxyURL); err != nil {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid SOCKS5 proxy configuration"})
 		return
 	}
 
@@ -1777,23 +1674,21 @@ func testProxyConnection(w http.ResponseWriter, r *http.Request) {
 	testURL := "https://httpbin.org/ip"
 	req, err := http.NewRequest("GET", testURL, nil)
 	if err != nil {
-		log.Printf("Error creating request: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to prepare proxy test request"})
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error making request through proxy: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Proxy connection failed: " + err.Error()})
+		log.Println("Proxy connection test failed")
+		respondWithJSON(w, http.StatusBadGateway, map[string]string{"error": "Proxy connection test failed"})
 		return
 	}
 	defer resp.Body.Close()
 
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Error reading response: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read proxy response"})
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	if err != nil || len(responseBody) > 65536 {
+		respondWithJSON(w, http.StatusBadGateway, map[string]string{"error": "Proxy response unavailable or too large"})
 		return
 	}
 
@@ -1803,34 +1698,40 @@ func testProxyConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 // Helper function to save settings to file (assumes mutex is already locked)
-func saveSettingsToFile() error {
-	// Create the directory if it doesn't exist
-	if err := os.MkdirAll("config", 0755); err != nil {
-		log.Fatalf("Failed to create config directory: %v", err)
-	}
+var settingsWriteMutex sync.Mutex
 
+func saveSettingsToFile() error {
+	settingsWriteMutex.Lock()
+	defer settingsWriteMutex.Unlock()
+	if err := os.MkdirAll("config", 0700); err != nil {
+		return err
+	}
 	settingsMutex.RLock()
 	snapshot := currentSettings
 	settingsMutex.RUnlock()
-
-	// 0600: the file contains API keys
-	file, err := os.OpenFile("config/settings.json", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	file, err := os.CreateTemp("config", ".settings-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	// the mode above only applies on creation
+	defer os.Remove(file.Name())
 	if err := file.Chmod(0600); err != nil {
-		log.Printf("Warning: could not chmod settings.json: %v", err)
+		file.Close()
+		return err
 	}
-
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(snapshot); err != nil {
+		file.Close()
 		return err
 	}
-
-	return nil
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), "config/settings.json")
 }
 
 // Proxy Settings Save Handler
@@ -1846,8 +1747,7 @@ func saveProxySettingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var newSettings ProxySettings
-	if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &newSettings) {
 		return
 	}
 
@@ -1861,8 +1761,6 @@ func saveProxySettingsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	println("Proxy settings saved successfully")
-
-	setGlobalProxy()
 
 	respondWithJSON(w, http.StatusOK, map[string]string{"message": "Proxy settings saved successfully"})
 }
@@ -1880,8 +1778,7 @@ func saveProwlarrSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var newSettings ProwlarrSettings
-	if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &newSettings) {
 		return
 	}
 
@@ -1917,8 +1814,7 @@ func saveJackettSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var newSettings JackettSettings
-	if err := json.NewDecoder(r.Body).Decode(&newSettings); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+	if !decodeLimitedSettingsBody(w, r, &newSettings) {
 		return
 	}
 
@@ -1956,10 +1852,20 @@ func convertTorrentToMagnetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form with 10MB memory limit
-	const maxUploadSize = 10 << 20 // 10MB
+	// Bound the entire multipart request, not merely memory buffering.
+	const maxUploadSize = 10 << 20
+	if r.ContentLength > maxUploadSize {
+		respondWithJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "Torrent metadata request exceeds 10 MB"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Failed to parse form: " + err.Error()})
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			respondWithJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "Torrent metadata request exceeds 10 MB"})
+			return
+		}
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Failed to parse multipart form"})
 		return
 	}
 
@@ -1973,7 +1879,7 @@ func convertTorrentToMagnetHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Check file size
 	if header.Size > maxUploadSize {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "File too large"})
+		respondWithJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "File too large"})
 		return
 	}
 

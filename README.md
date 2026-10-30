@@ -1,192 +1,125 @@
-# BitPlay: Torrent Streaming Web App
+# BytePlay
 
-BitPlay is a web application built with Go that allows you to stream video content directly from torrents in your browser. It features a clean web UI, support for SOCKS5 proxies, and integration with Prowlarr and Jackett for seamless torrent searching.
+**Torrent-to-HLS playback in your browser.** BytePlay is a single-process Go application with an `anacrolix/torrent` engine, on-demand FFprobe/FFmpeg HLS packaging, selective H.264/AAC transcoding, Video.js 8 playback, and the Midnight Current interface.
 
-![Bitplay Home](screenshots/bitplay_home.png)
+This repository evolves the upstream BitPlay project while retaining the existing SOCKS5, Prowlarr, Jackett, subtitles, and settings integrations. Use only media and torrents you are authorized to access. **A proxy setting is not a guarantee of privacy or anonymity.** The app's SOCKS5 option is best-effort for supported HTTP traffic; BitTorrent peer/tracker egress isolation has not been certified. For a fail-closed network requirement, run BytePlay inside a VPN/network namespace with enforced egress boundaries.
 
-## Features
+> **Release status:** Development branch `implement/byteplay-v0.1.1` is under active verification. GitHub-hosted CI has passed real locally seeded HLS playback in Chrome and a Docker authentication/media smoke test. A tagged image and production release are **not certified or guaranteed to be published**; see `TODO.md` and `docs/evidence/M8.md` for open gates.
 
-*   **Direct Torrent Streaming:** Stream video files from magnet links or torrent files directly without needing to download them completely first.
-*   **MKV & Audio Track Support:** MKV files are remuxed on the fly with ffmpeg (no re-encoding), and files with multiple audio tracks get a track picker. If a codec genuinely can't play in your browser, BitPlay tells you which one and gives you the stream URL to open in VLC or mpv instead.
-*   **Web-Based UI:** Access and control BitPlay through a user-friendly web interface.
-*   **Proxy Support:** Configure a SOCKS5 proxy for all torrent-related traffic (fetching metadata, peer connections). (Note: HTTP proxies are not currently supported).
-*   **Prowlarr Integration:** Connect to your Prowlarr instance to search across your configured indexers directly within BitPlay.
-*   **Jackett Integration:** Connect to your Jackett instance as an alternative search provider.
-*   **Subtitles:** Embedded SRT subtitles are converted to VTT on the fly, and you can upload your own `.srt`/`.vtt` file during playback.
-*   **Optional Basic Auth:** Protect a publicly reachable instance with a username and password via environment variables.
-*   **Maintenance Tools:** A settings tab with live session stats, recent server logs, and a cache purge button.
-*   **Session Management:** Handles multiple torrent sessions and cleans up inactive ones.
+## What works
 
-## Getting Started
+- Open a magnet URI, raw 40-character infohash, or upload a `.torrent` metadata file (10 MiB limit).
+- Select a video within a torrent, begin retrieving needed pieces, and play from a growing HLS playlist.
+- Stream-copy compatible H.264/AAC files; convert incompatible audio to AAC; convert other supported video to H.264 using `libx264 -preset ultrafast`. Requires FFmpeg and FFprobe.
+- Video.js player with generation-based seeking, explicit pause/resume handling, captions, file information, original file download, and multiple-audio selection when present.
+- Keep existing settings for SOCKS5 proxy, Prowlarr, Jackett, and session/cache maintenance.
+- A **Played videos** section in the homepage that remembers actually played files locally in your browser, with Resume, Replay, Remove, and Clear history controls. The legacy Settings modal now has explicit readable tab/test/save label colors.
 
-You can run BitPlay either directly using Go or via Docker Compose.
+## Played history (browser-only)
 
-### Prerequisites
+When video playback actually begins, BytePlay records its filename, selected torrent file index, torrent magnet/infohash, approximate resume position, duration (if known), file size, and last-played time in that browser's `localStorage`. It updates the saved position during playback and on pause/page exit, retaining up to **30 recent videos**. These entries are not stored in BytePlay's server database, are not synced between browsers, and do not keep a torrent session or HLS playlist alive.
 
-*   **Go:** Requires Go 1.25 or later (if running locally).
-*   **ffmpeg:** Optional for local runs; it enables MKV remuxing and audio track selection. The Docker image already includes it.
-*   **Docker & Docker Compose:** Required if running with Docker.
+From the homepage's **Played videos** section, choose **Resume** (restart HLS near the saved absolute time) or **Replay** (start at zero), remove an entry, or clear the complete list. Both replay paths reopen the saved torrent source and the chosen file through the existing authenticated API, and therefore still require reachable torrent peers and compatible media. Saved magnet links may include private tracker tokens; use **Clear history** on shared computers. Clearing browser/site data also removes the Played history. Browser storage may be disabled or unavailable; video streaming must still work without it. All user-supplied filenames are inserted with text-safe DOM APIs.
 
-### Running Locally with Go
+Playback availability depends on actual torrent peers, codec support, local resources, and browser support. Downloading torrent data is distinct from creating HLS output; selected-file completion is not required before playback in the verified synthetic fixture. The app does not promise a video will play when the source is unsupported or unavailable.
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/aculix/bitplay.git
-    cd bitplay
-    ```
-2.  **Download dependencies:**
-    ```bash
-    go mod download
-    ```
-3.  **Run the application:**
-    ```bash
-    go run main.go
-    ```
-    By default, the server will start on `http://localhost:3347`.
+## Requirements
 
-### Running with Docker Compose
+- Go 1.26.6 toolchain (the module declares a Go 1.25 minimum, but CI uses the pinned toolchain).
+- FFmpeg, FFprobe, including the libx264 and AAC encoders, available on `PATH`.
+- Node.js 22 and npm for recompiling the Tailwind v4 stylesheet when changing frontend source files.
+- Docker with BuildKit for the multi-stage container option.
 
-This is the recommended method for deployment.
+## Local development
 
-1.  **Create a `docker-compose.yml` file:**
-    ```yaml
-    services:
-      bitplay:
-        image: ghcr.io/aculix/bitplay:latest
-        container_name: bitplay
-        ports:
-          - 3347:3347 # Expose the web UI port
-        volumes:
-          # Mount the config directory for persistent settings (Optional)
-          - ./config:/app/config
-          # Mount the download location of the file (Optional)
-          - ./torrent-data:/app/torrent-data
-        restart: unless-stopped
-    ```
-    *   **Optional Persistence:** By default, settings (Proxy, Prowlarr/Jackett) are stored inside the container and will be lost if the container is restarted. To make settings persistent across restarts, you can mount a local directory from your host to `/app/config` inside the container using the `volumes` option above. 
-    *   If you choose to mount the directory for persistence, you **must** create the directory on your host machine **before** starting the container for the first time: `mkdir -p ./config`. 
-    *   If you don't mount this volume, the application will still function correctly, but you will need to re-configure your settings after each container restart. Torrent data itself is always ephemeral.
-
-2.  **Start the container:**
-    ```bash
-    docker-compose up -d
-    ```
-3.  **Access the application:** Open your browser to `http://<your-server-ip>:3347`.
-
-### Running with Docker Run
-
-Alternatively, you can run the container directly using `docker run`:
-
-1.  **(Optional) Create the config directory for persistence:** If you want your settings (Proxy, Prowlarr/Jackett) to persist across container restarts, create the configuration directory on your host first:
-    ```bash
-    mkdir -p ./config
-    ```
-    If you skip this step and the volume mount below, the application will still work, but settings will be lost on restart.
-
-2.  **Run the container:**
-    ```bash
-    docker run -d \
-      --name bitplay \
-      -p 3347:3347 \
-      # Add the volume mount below ONLY if you want persistent settings (and created ./config above)
-      -v $(pwd)/config:/app/config \
-      # The location where the downloaded file is saved
-      -v $(pwd)/torrent-data:/app/torrent-data \
-      --restart unless-stopped \
-      ghcr.io/aculix/bitplay:latest
-    ```
-    *   `-d`: Run in detached mode (background).
-    *   `--name bitplay`: Assign a name to the container.
-    *   `-p 3347:3347`: Map port 3347 on the host to port 3347 in the container.
-    *   `-v $(pwd)/config:/app/config`: (Optional) Mount the local `./config` directory for persistent settings.
-    *   `--restart unless-stopped`: Configure the container to restart automatically unless manually stopped.
-    *   `ghcr.io/aculix/bitplay:latest`: The Docker image to use.
-
-3.  **Access the application:** Open your browser to `http://<your-server-ip>:3347`.
-
-## Configuration
-
-BitPlay is configured primarily through its web interface after starting the application.
-
-1.  **Access the Web UI:** Go to `http://localhost:3347` (or your server's address).
-2.  **Navigate to Settings:** Find the settings or configuration section within the UI.
-3.  **Configure:**
-    *   **Proxy:** Enable/disable proxy support and provide the full SOCKS5 proxy URL (e.g., `socks5://user:pass@host:port`). Test the connection using the provided button.
-    *   **Prowlarr:** Enable/disable Prowlarr, provide the Prowlarr Host URL (e.g., `http://prowlarr:9696`), and your Prowlarr API Key. Test the connection.
-    *   **Jackett:** Enable/disable Jackett, provide the Jackett Host URL (e.g., `http://jackett:9117`), and your Jackett API Key. Test the connection.
-    *   **Search Timeout / TLS:** Both indexer tabs let you raise the search timeout (default 30s, useful for Jackett setups with many indexers) and skip TLS certificate verification for self-signed Prowlarr/Jackett instances.
-    *   **Maintenance:** The fourth settings tab shows active torrent sessions, recent server logs, and a Purge Cache button that stops all sessions and deletes everything downloaded to disk.
-
-Settings are saved automatically to `/app/config/settings.json` inside the Docker container, which maps to `./config/settings.json` on the host via the mounted volume in the example Docker Compose setup above. API keys are never sent back to the browser once saved.
-
-### Environment Variables
-
-| Variable | Description |
-| --- | --- |
-| `BITPLAY_AUTH_USERNAME` / `BITPLAY_AUTH_PASSWORD` | Set both to protect the entire app (UI, API, and video streams) with HTTP basic auth. Recommended for instances exposed to the internet. |
-| `BITPLAY_MAX_REMUX` | Maximum concurrent ffmpeg remux streams (default `3`). |
-
-Example with Docker Compose:
-
-```yaml
-services:
-  bitplay:
-    image: ghcr.io/aculix/bitplay:latest
-    ports:
-      - 3347:3347
-    environment:
-      - BITPLAY_AUTH_USERNAME=admin
-      - BITPLAY_AUTH_PASSWORD=change-me
-    restart: unless-stopped
+```bash
+git clone https://github.com/aisynapze/byteplay.git
+cd byteplay
+git switch implement/byteplay-v0.1.1
+npm ci
+npm run build
+# Recommended: sparse classic torrent file I/O (set before process startup).
+TORRENT_STORAGE_DEFAULT_FILE_IO=classic go run .
 ```
 
-### Routing Through a VPN with Gluetun
+Open <http://127.0.0.1:3347>. The default listener is loopback-only and does not require credentials. Build with `go run .` rather than `go run main.go`: BytePlay uses multiple Go source files in package main. Go downloads imported module dependencies on demand; `go mod download` is not required as a standalone step.
 
-If you want all of BitPlay's traffic (not just torrent traffic) forced through a VPN, run it behind [gluetun](https://github.com/qdm12/gluetun) and attach BitPlay to gluetun's network:
+For access from another computer, **set both basic-auth credentials** and explicitly choose a network listener; prefer HTTPS via a secured reverse proxy rather than directly exposing HTTP credentials:
 
-```yaml
-services:
-  gluetun:
-    image: qmcgaw/gluetun
-    container_name: gluetun
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
-    ports:
-      - 3347:3347 # BitPlay's UI is published via gluetun
-    environment:
-      - VPN_SERVICE_PROVIDER=your-provider
-      # See gluetun's docs for your provider's credentials/variables
-    restart: unless-stopped
-
-  bitplay:
-    image: ghcr.io/aculix/bitplay:latest
-    container_name: bitplay
-    network_mode: service:gluetun
-    volumes:
-      - ./config:/app/config
-    restart: unless-stopped
+```bash
+BITPLAY_LISTEN_HOST=0.0.0.0 \
+BITPLAY_AUTH_USERNAME=byteplay-admin \
+BITPLAY_AUTH_PASSWORD='replace-with-a-strong-password' \
+go run .
 ```
 
-With `network_mode: service:gluetun`, everything BitPlay does (tracker announces, peer connections, DHT) goes through the VPN, and you reach the UI through gluetun's published port. The built-in SOCKS5 proxy setting is the lighter option if you only want torrent traffic proxied.
+The application rejects non-loopback, unauthenticated binding unless an explicit unsafe development opt-in is set. Do not enable unauthenticated LAN mode on an internet-accessible host.
 
-## Usage
+## Docker (build locally; not dependent on an unpublished registry tag)
 
-1.  **Configure Settings:** Set up your proxy and search providers (Prowlarr/Jackett) as described above.
-2.  **Search:** Use the search bar to query Prowlarr or Jackett for torrents.
-3.  **Add Torrent:** Paste a magnet link directly or click a search result to add the torrent to BitPlay.
+```bash
+docker build -t byteplay:local .
+mkdir -p config torrent-data
+docker run -d --name byteplay \
+  -p 127.0.0.1:3347:3347 \
+  -e BITPLAY_LISTEN_HOST=0.0.0.0 \
+  -e BITPLAY_AUTH_USERNAME=byteplay-admin \
+  -e BITPLAY_AUTH_PASSWORD='replace-with-a-strong-password' \
+  -v "$PWD/config:/app/config" \
+  -v "$PWD/torrent-data:/app/torrent-data" \
+  --restart unless-stopped \
+  byteplay:local
+```
 
-    > BitPlay also supports opening from another app/program by providing torrent or magnet link as query parameter `torrent`. The link needs to be URL-encoded! 
-    >
-    > Ex: `http://localhost:3347?torrent=magnet%3A%3Fxt%3Durn%3Abtih%3A08ada5a7a6183aae1e09d831df6748d566095a10%26dn%3DSintel%26tr%3Dudp%253A%252F%252Fexplodie.org%253A6969%26tr%3Dudp%253A%252F%252Ftracker.coppersurfer.tk%253A6969%26tr%3Dudp%253A%252F%252Ftracker.empire-js.us%253A1337%26tr%3Dudp%253A%252F%252Ftracker.leechers-paradise.org%253A6969%26tr%3Dudp%253A%252F%252Ftracker.opentrackr.org%253A1337%26tr%3Dwss%253A%252F%252Ftracker.btorrent.xyz%26tr%3Dwss%253A%252F%252Ftracker.fastcast.nz%26tr%3Dwss%253A%252F%252Ftracker.openwebtorrent.com%26ws%3Dhttps%253A%252F%252Fwebtorrent.io%252Ftorrents%252F%26xs%3Dhttps%253A%252F%252Fwebtorrent.io%252Ftorrents%252Fsintel.torrent`
+Open <http://127.0.0.1:3347> and authenticate. The Docker image rebuilds CSS using the locked npm dependencies, compiles the Go executable with module/build caches, and ships FFmpeg/FFprobe without Node or the Go toolchain. For access from other computers, deliberately change the host-side `-p` binding **only** after configuring authentication and an appropriate HTTPS ingress.
 
-4.  **Stream:** Once the torrent info is loaded, select the video file you want to watch. BitPlay will start downloading and streaming it directly in the built-in player.
+`config/settings.json` stores persistent settings; `torrent-data` stores downloaded torrent pieces. The HLS cache lives in `./hls-cache` inside the application runtime (separate from persistent `torrent-data`). Its sessions expire after 15 minutes with no genuine demand, and superseded HLS generations are removed. The combined disk watermark counts both roots. Competing HLS generations reserve their permitted output space before FFmpeg runs; already written bytes count inside the reservation, and the reservation is released on worker exit. At startup BytePlay removes abandoned, internally named HLS playback directories; unrelated files and symlinks are preserved. **This recovery assumes one BytePlay instance owns the HLS directory**: do not share one HLS cache volume between independently running servers. This is not archival storage. Torrent piece writes now use a guarded file-storage adapter sharing the same cache ledger as HLS workers. The Docker runtime sets `TORRENT_STORAGE_DEFAULT_FILE_IO=classic` to use the upstream **classic file I/O**, which grows a `.part` file only to the farthest written piece offset and can therefore fetch initial video pieces even when the full file size exceeds the configured budget. BytePlay's guarded storage projects that sparse growth before each write under the shared HLS reservation mutex. For a local `go run .` without that environment variable, anacrolix defaults to **mmap**, which preallocates the whole file's apparent length before the first piece; BytePlay conservatively reserves that full length and rejects the write when capacity is unavailable. Sparse mode does not make far-offset seeks free: a jump near the end may still extend the apparent file size past the budget and be rejected. This is a single-process apparent-file-length limit, **not** an OS-level disk-block quota or protection against unrelated processes writing to either data directory. Container teardown or cache purge may remove temporary playback output; do not treat it as archival media storage.
 
-## Contributing
+The intended future published image name is `ghcr.io/aisynapze/byteplay`, contingent on release certification. Do not assume a `:latest` tag is already published or production-approved.
 
-Contributions are welcome! Please feel free to submit pull requests or open issues. (You can add more details here if you have specific contribution guidelines).
+## Playback startup cache threshold
 
-## License
+**Default: 9% of the selected video's downloaded bytes.** BytePlay requests the first needed selected-file pieces alongside FFprobe/FFmpeg and attaches Video.js only once this byte threshold and at least two finalized HLS segments are ready. This is **not** a percentage of the entire torrent or HLS output directory. Settings → Maintenance permits **0–100%**; **0% disables the additional startup gate**. It persists in `config/settings.json` and applies only to new playbacks. For a large selected video, 9% may require hundreds of MiB, slow startup or exceed the cache quota; this does not guarantee no later rebuffering.
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+## Settings and safety
+
+| Environment variable | Purpose |
+|---|---|
+| `BITPLAY_LISTEN_HOST` | Defaults to `127.0.0.1` locally; Docker explicitly sets `0.0.0.0` |
+| `BITPLAY_AUTH_USERNAME` / `BITPLAY_AUTH_PASSWORD` | Required pair for an authenticated network listener; protects UI, API, settings and streaming routes |
+| `BITPLAY_ALLOW_UNAUTHENTICATED_LAN=1` | Dangerous development-only bypass; never use for a public deployment |
+| `BITPLAY_MAX_REMUX` | Existing remux concurrency control (the new HLS worker also has explicit bounded slots) |
+| `BITPLAY_CACHE_MAX_BYTES` | Positive-integer combined budget for `torrent-data` and `hls-cache`; default 10737418240 bytes (10 GiB). HLS output reservations and torrent piece growth checks are serialized within one BytePlay instance. The mmap backend reserves full file lengths; this does not constitute filesystem-level free-space or multi-instance allocation control. |
+| `TORRENT_STORAGE_DEFAULT_FILE_IO` | Set to `classic` **before process startup** for sparse partial-file writes (default in the Docker runtime); unset uses anacrolix mmap and requires whole-file allocation headroom. This env variable is read by the library during package initialization, not switchable at runtime. |
+
+The Settings UI retains proxy, search-provider credentials, connection tests, and maintenance actions. Secret fields are redacted from settings reads; successful configuration does **not** establish that all host traffic is routed through a VPN. Avoid copying real credentials into CI logs or bug reports.
+
+## Verification
+
+```bash
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./...
+node --test client/assets/player-timeline.test.mjs client/assets/byteplay-core.test.mjs
+npm ci && npm run build
+```
+
+The GitHub-hosted CI workflow `.github/workflows/ci.yml` additionally verifies:
+- Separate race-enabled `TORRENT_STORAGE_DEFAULT_FILE_IO=classic` tests: small video-piece writes under a budget smaller than the declared file size, rejection of over-budget far-offset writes, and HLS/torrent shared headroom. The real Chrome torrent-backed HLS test also uses the classic backend; default mmap whole-file rejection tests remain independent.
+
+- A locally seeded legal H.264/AAC torrent with FFmpeg HLS, codec-route fixtures, segment readiness and generation-safe seeks.
+- Responsive home/watch UI and settings modal in headless Chromium.
+- **Real Video.js HLS decoding in installed Google Chrome**: the test requires downloaded playlist/segments, decoded frames, and advancing playback time. Playwright's bundled Chromium headless shell does not necessarily ship H.264 codecs and must not be used as a substitute for the Chrome media gate.
+- A locally built Docker image starts with authentication, rejects anonymous API access, exposes FFmpeg/libx264/AAC, and contains freshly built CSS.
+
+The real-browser fixture is **integration-test-only**, bound to loopback and not included in normal binaries. Tests use generated sine/test-pattern media rather than downloaded copyrighted videos.
+
+**Cache-owner restrictions:** Linux, macOS and supported BSD systems use an advisory OS file lock held for the process lifetime. The application fails closed when this lock cannot be obtained or the root/lock file is a symlink. Do not deploy multiple BytePlay instances on the same HLS cache directory, or rely on network filesystems that do not guarantee advisory locks. Other operating systems require an audited native lock implementation before startup is allowed.
+
+
+## Open release gates
+
+BytePlay remains pre-release until real-media Firefox/Safari coverage, 30-minute MKV/keyframe/PTS seek accuracy, multi-audio and subtitle interaction checks, CPU/RSS/performance and physical disk-block/space-pressure benchmarks, broader accessibility/mobile viewports, and independent production review are completed. The recommended classic backend supports partial allocation of larger files, but its far-offset seek behavior, startup latency and sustained resource profile still require production-size benchmarks. Unset/default mmap continues to require whole-file apparent-size headroom. Evidence and outstanding checks are tracked in `docs/evidence/`, `WORKLOG.md`, and `TODO.md`.
+
+Original upstream project: [aculix/bitplay](https://github.com/aculix/bitplay). This fork is branded BytePlay.

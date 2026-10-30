@@ -1,39 +1,32 @@
-# Build stage
+# Build the shipped Tailwind stylesheet from the locked npm graph; do not
+# rely on a stale output.css from the repository checkout.
+FROM node:22-alpine AS frontend
+WORKDIR /ui
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY client ./client
+RUN npm run build
+
+# Go 1.26 build: download only modules needed by imported packages.
 FROM golang:1.26-alpine AS builder
-
-# Set working directory for the build
 WORKDIR /app
-
-# Copy module files first to leverage Docker cache
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy all source files including client directory
 COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=readonly go build -ldflags="-w -s" -o main .
 
-# Build the Go app with static linking
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o main .
-
-# Final stage
+# Runtime: explicit FFmpeg/FFprobe, no Node/npm or Go toolchain.
 FROM alpine:3.22
-# ffmpeg is used for MKV remuxing and audio track selection
 RUN apk --no-cache add ca-certificates ffmpeg
-
-# ARG APP_VERSION, will be set during build by github actions
 ARG APP_VERSION=0.0.0
 LABEL app.version=$APP_VERSION
-
-# Set working directory in final image
 WORKDIR /app
-
-# Copy the compiled binary from builder
 COPY --from=builder /app/main .
-
-# Copy client directory from builder
 COPY --from=builder /app/client ./client/
-
-# Expose the port your app runs on
+COPY --from=frontend /ui/client/assets/output.css ./client/assets/output.css
+# Classic file I/O grows .part files only through requested piece extents.
+# The quota guard projects sparse file growth instead of mmap full-file allocation.
+ENV TORRENT_STORAGE_DEFAULT_FILE_IO=classic
+ENV BITPLAY_LISTEN_HOST=0.0.0.0
 EXPOSE 3347
-
-# Command to run the application
 CMD ["/app/main"]

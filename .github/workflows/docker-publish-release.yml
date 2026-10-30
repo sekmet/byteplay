@@ -10,7 +10,10 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
   build_and_publish:
+    needs: quality
     name: Push Docker image to Github Container Registry
     runs-on: ubuntu-latest
     permissions:

@@ -1,0 +1,346 @@
+name: BytePlay quality checks
+on:
+  push:
+    branches: ["implement/byteplay-v0.1.1"]
+    paths:
+      - "*.go"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "client/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Dockerfile"
+      - ".github/workflows/ci.yml"
+      - "scripts/**"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Go, security tests, and frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@v4
+      - name: Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+      - name: Diagnose Go formatting
+        run: |
+          gofmt -d *.go
+      - name: Compile
+        run: go build ./...
+      - name: Verify downloaded Go modules
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test ./...
+      - name: Race detector
+        run: go test -race ./...
+      - name: Sparse classic backend (separate process initialization)
+        env:
+          TORRENT_STORAGE_DEFAULT_FILE_IO: classic
+        run: go test -race -count=1 -run '^TestTorrentStorageClassic' ./...
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: JavaScript syntax
+        run: |
+          node --check client/assets/index.js
+          node --check client/assets/player-timeline.js
+          node --check client/assets/byteplay-app.js
+          node --check client/assets/byteplay-core.mjs
+          node --check client/assets/played-history.mjs
+      - name: Frontend rules and timeline tests
+        run: node --test client/assets/player-timeline.test.mjs client/assets/byteplay-core.test.mjs client/assets/played-history.test.mjs
+      - name: CSS build
+        run: |
+          npm ci
+          npm run build
+      - name: Go formatting gate
+        run: |
+          test -z "$(gofmt -l *.go)"
+      - name: Install FFmpeg and FFprobe
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: FFmpeg availability
+        run: |
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -hide_banner -encoders | grep -E '[[:space:]]libx264[[:space:]]'
+          ffmpeg -hide_banner -encoders | grep -E '[[:space:]]aac[[:space:]]'
+          ffprobe -version
+
+  media-source:
+    name: Local seed and FFmpeg codec route fixtures (20/100 Mbps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+      - name: Generate 60-second synthetic H264/AAC media and sparse padding
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg time
+          mkdir -p "$RUNNER_TEMP/byteplay-seed"
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i 'testsrc2=size=640x360:rate=24' \
+            -f lavfi -i 'sine=frequency=440:sample_rate=48000' \
+            -t 60 -c:v libx264 -preset ultrafast -crf 32 \
+            -pix_fmt yuv420p -c:a aac -b:a 96k \
+            -movflags +faststart "$RUNNER_TEMP/byteplay-seed/clip.mp4"
+          ffmpeg -hide_banner -loglevel error -y -i "$RUNNER_TEMP/byteplay-seed/clip.mp4" \
+            -t 18 -c:v copy -c:a ac3 -b:a 192k "$RUNNER_TEMP/byteplay-seed/audio-ac3.mkv"
+          ffmpeg -hide_banner -loglevel error -y -i "$RUNNER_TEMP/byteplay-seed/clip.mp4" \
+            -t 18 -c:v mpeg4 -q:v 5 -c:a copy "$RUNNER_TEMP/byteplay-seed/video-mpeg4.mkv"
+          truncate -s 230686720 "$RUNNER_TEMP/byteplay-seed/padding.bin"
+          test -s "$RUNNER_TEMP/byteplay-seed/clip.mp4"
+      - name: Range and partial-download integration, loopback peers only
+        env:
+          BYTEPLAY_TEST_FIXTURE_ROOT: ${{ runner.temp }}/byteplay-seed
+        run: |
+          go test -tags=integration -run "Test(SeededMediaSourceRangeBeforeFullDownload|HLSFFmpegRouteFixtureMatrix|TorrentBackedHLSReadyBeforeWholeTorrentCompletion|CopySeekEffectiveStart)" -count=1 -timeout=120s -v .
+          # Race-instrumented HLS suite may exceed 120s as four seeks are verified.
+          go test -race -tags=integration -run "Test(SeededMediaSourceRangeBeforeFullDownload|HLSFFmpegRouteFixtureMatrix|TorrentBackedHLSReadyBeforeWholeTorrentCompletion|CopySeekEffectiveStart)" -count=1 -timeout=180s -v .
+      - name: Measure copy vs x264 HLS cost on the same synthetic source
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/byteplay-profile/copy" "$RUNNER_TEMP/byteplay-profile/x264"
+          /usr/bin/time -f 'BYTEPLAY_COPY_PROFILE wall_s=%e user_cpu_s=%U system_cpu_s=%S max_rss_kib=%M' \
+            ffmpeg -hide_banner -loglevel error -nostdin -y \
+            -i "$RUNNER_TEMP/byteplay-seed/clip.mp4" -t 30 \
+            -map 0:v:0 -map 0:a:0 -c:v copy -c:a copy \
+            -f hls -hls_time 4 -hls_list_size 0 -hls_flags temp_file \
+            -hls_segment_filename "$RUNNER_TEMP/byteplay-profile/copy/segment-%06d.ts" \
+            "$RUNNER_TEMP/byteplay-profile/copy/index.m3u8"
+          /usr/bin/time -f 'BYTEPLAY_X264_PROFILE wall_s=%e user_cpu_s=%U system_cpu_s=%S max_rss_kib=%M' \
+            ffmpeg -hide_banner -loglevel error -nostdin -y \
+            -i "$RUNNER_TEMP/byteplay-seed/clip.mp4" -t 30 \
+            -map 0:v:0 -map 0:a:0 -c:v libx264 -preset ultrafast \
+            -threads 2 -pix_fmt yuv420p -c:a aac -b:a 128k \
+            -f hls -hls_time 4 -hls_list_size 0 -hls_flags temp_file \
+            -hls_segment_filename "$RUNNER_TEMP/byteplay-profile/x264/segment-%06d.ts" \
+            "$RUNNER_TEMP/byteplay-profile/x264/index.m3u8"
+          test -s "$RUNNER_TEMP/byteplay-profile/copy/index.m3u8"
+          test -s "$RUNNER_TEMP/byteplay-profile/x264/index.m3u8"
+          echo 'BYTEPLAY_PROFILE_FIXTURE_PASS: 30s local synthetic clip; runner-specific, not a sustained workload benchmark'
+
+  browser-ui:
+    name: Chromium home/watch responsive smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GOFLAGS: -mod=readonly
+      BYTEPLAY_E2E_URL: http://127.0.0.1:3347
+      BYTEPLAY_SCREENSHOT_DIR: /tmp/byteplay-ui-shots
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: CSS build and pinned ephemeral Chromium test dependency
+        run: |
+          npm ci
+          npm run build
+          npm install --no-save --package-lock=false --ignore-scripts playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Launch BytePlay on a loopback-only server
+        run: |
+          go build -o "$RUNNER_TEMP/byteplay-ui-server" .
+          "$RUNNER_TEMP/byteplay-ui-server" > "$RUNNER_TEMP/byteplay-ui-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/byteplay-ui-server.pid"
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3347/ >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/byteplay-ui-server.log"
+          exit 1
+      - name: Check rendered home, watch, settings and responsive behavior
+        run: node scripts/verify-ui.cjs
+      - name: Upload screenshots for human M7 review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: byteplay-m7-chromium-screenshots
+          path: /tmp/byteplay-ui-shots
+          if-no-files-found: warn
+          retention-days: 7
+
+  browser-media:
+    name: Real Video.js HLS decode from seeded torrent (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GOFLAGS: -mod=readonly
+      TORRENT_STORAGE_DEFAULT_FILE_IO: classic
+      BYTEPLAY_E2E_URL: http://127.0.0.1:3347
+      BYTEPLAY_SCREENSHOT_DIR: /tmp/byteplay-browser-media
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install FFmpeg, pinned Chromium runner and frontend assets
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          npm ci
+          npm run build
+          npm install --no-save --package-lock=false --ignore-scripts playwright@1.56.1
+          npx playwright install --with-deps chrome firefox
+      - name: Generate royalty-free 32-second H264/AAC fixture and sparse padding
+        run: |
+          mkdir -p "$RUNNER_TEMP/byteplay-browser-seed"
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i 'testsrc2=size=640x360:rate=24' \
+            -f lavfi -i 'sine=frequency=440:sample_rate=48000' \
+            -t 32 -c:v libx264 -preset ultrafast -crf 32 \
+            -pix_fmt yuv420p -c:a aac -b:a 96k \
+            -movflags +faststart "$RUNNER_TEMP/byteplay-browser-seed/clip.mp4"
+          # Copy a synthetic short clip into a real 30-minute indexed MKV.
+          ffmpeg -hide_banner -loglevel error -y \
+            -stream_loop 56 -i "$RUNNER_TEMP/byteplay-browser-seed/clip.mp4" \
+            -f lavfi -i 'sine=frequency=880:sample_rate=48000' \
+            -t 1800 -map 0:v:0 -map 0:a:0 -map 1:a:0 \
+            -c:v copy -c:a:0 copy -c:a:1 aac -b:a:1 96k \
+            "$RUNNER_TEMP/byteplay-browser-seed/long.mkv"
+          # Distinct absolute FFprobe audio stream indexes 1 and 2.
+          ffprobe -v error -select_streams a -show_entries stream=index \
+            -of csv=p=0 "$RUNNER_TEMP/byteplay-browser-seed/long.mkv" \
+            | grep -q '^2$'
+          truncate -s 52428800 "$RUNNER_TEMP/byteplay-browser-seed/padding.bin"
+      - name: Decode real torrent-backed HLS in the browser
+        env:
+          BYTEPLAY_BROWSER_FIXTURE_ROOT: ${{ runner.temp }}/byteplay-browser-seed
+          BYTEPLAY_BROWSER_STOP_FILE: ${{ runner.temp }}/byteplay-browser-stop
+        run: |
+          set -e
+          rm -f "$BYTEPLAY_BROWSER_STOP_FILE"
+          go test -tags=integration -run '^TestBrowserHLSFixtureHost$' -count=1 -timeout=300s -v . > "$RUNNER_TEMP/browser-fixture.log" 2>&1 &
+          fixture_pid=$!
+          trap 'touch "$BYTEPLAY_BROWSER_STOP_FILE"; kill "$fixture_pid" 2>/dev/null || true; cat "$RUNNER_TEMP/browser-fixture.log"' EXIT
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3347/__byteplay_browser_fixture >/dev/null; then ready=1; break; fi
+            if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then echo "Browser fixture failed to become ready"; exit 1; fi
+          node scripts/verify-browser-hls.cjs
+          BYTEPLAY_BROWSER_ENGINE=firefox node scripts/verify-browser-hls.cjs
+          touch "$BYTEPLAY_BROWSER_STOP_FILE"
+          wait "$fixture_pid"
+          trap - EXIT
+      - name: Upload real video playback screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: byteplay-m7-real-hls-chromium
+          path: /tmp/byteplay-browser-media
+          if-no-files-found: warn
+          retention-days: 7
+
+  docker-smoke:
+    name: Docker release image, auth and media capabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build deterministic standalone runtime image
+        run: docker build --progress=plain -t byteplay:ci .
+      - name: Boot with explicit authenticated network binding
+        run: |
+          mkdir -p "$RUNNER_TEMP/byteplay-ci-hls"
+          docker run -d --name byteplay-ci \
+            -v "$RUNNER_TEMP/byteplay-ci-hls:/app/hls-cache" \
+            -p 127.0.0.1:13347:3347 \
+            -e BITPLAY_LISTEN_HOST=0.0.0.0 \
+            -e BITPLAY_AUTH_USERNAME=ci-test \
+            -e BITPLAY_AUTH_PASSWORD=local-fixture-password \
+            byteplay:ci
+          for attempt in $(seq 1 45); do
+            if curl -fsS --user ci-test:local-fixture-password \
+              http://127.0.0.1:13347/api/v1/capabilities -o /tmp/byteplay-capabilities.json; then break; fi
+            sleep 1
+          done
+          test -s /tmp/byteplay-capabilities.json
+          python3 -c 'import json; c=json.load(open("/tmp/byteplay-capabilities.json")); assert c["ffmpeg"] is True, c'
+          curl -fsS --user ci-test:local-fixture-password http://127.0.0.1:13347/healthz | grep -q '^ok'
+          unauthenticated=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:13347/api/v1/capabilities)
+          test "$unauthenticated" = 401
+          docker exec byteplay-ci ffprobe -version
+          docker exec byteplay-ci ffmpeg -hide_banner -encoders | grep -E '[[:space:]]libx264[[:space:]]'
+          docker exec byteplay-ci ffmpeg -hide_banner -encoders | grep -E '[[:space:]]aac[[:space:]]'
+          docker exec byteplay-ci sh -c 'test -s /app/client/assets/output.css'
+          echo BYTEPLAY_DOCKER_AUTH_MEDIA_CSS_PASS
+      - name: Reject second instance sharing the active HLS cache
+        run: |
+          set -e
+          set +e
+          docker run --rm --name byteplay-ci-conflict \
+            -v "$RUNNER_TEMP/byteplay-ci-hls:/app/hls-cache" \
+            -e BITPLAY_LISTEN_HOST=0.0.0.0 \
+            -e BITPLAY_AUTH_USERNAME=ci-test \
+            -e BITPLAY_AUTH_PASSWORD=local-fixture-password \
+            byteplay:ci > "$RUNNER_TEMP/cache-conflict.log" 2>&1
+          code=$?
+          set -e
+          test "$code" -ne 0
+          grep -q 'HLS cache ownership' "$RUNNER_TEMP/cache-conflict.log"
+          curl -fsS --user ci-test:local-fixture-password \
+            http://127.0.0.1:13347/api/v1/capabilities >/dev/null
+          echo BYTEPLAY_SECOND_CACHE_OWNER_REJECTED
+      - name: Verify crash recovery only reclaims internally owned HLS directories
+        run: |
+          set -e
+          orphan=cccccccccccccccccccccccccccccccc
+          docker exec byteplay-ci sh -c "mkdir -p /app/hls-cache/$orphan/g/1 /app/hls-cache/operator-notes"
+          docker exec byteplay-ci sh -c "printf stale > /app/hls-cache/$orphan/g/1/segment-000000.ts"
+          docker exec byteplay-ci sh -c 'printf preserve > /app/hls-cache/operator-notes/readme'
+          docker kill -s KILL byteplay-ci >/dev/null
+          docker start byteplay-ci >/dev/null
+          ready=0
+          for attempt in $(seq 1 45); do
+            if curl --silent --fail --user ci-test:local-fixture-password \
+              http://127.0.0.1:13347/api/v1/capabilities >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          test "$ready" = 1
+          docker exec byteplay-ci sh -c "test ! -e /app/hls-cache/$orphan"
+          docker exec byteplay-ci sh -c 'test "$(cat /app/hls-cache/operator-notes/readme)" = preserve'
+          anonymous=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:13347/api/v1/capabilities)
+          test "$anonymous" = 401
+          echo BYTEPLAY_DOCKER_CRASH_RECOVERY_PASS
+      - name: Container diagnostics
+        if: failure()
+        run: docker logs byteplay-ci 2>&1 | tail -80 || true
+      - name: Stop fixture
+        if: always()
+        run: docker rm -f byteplay-ci || true

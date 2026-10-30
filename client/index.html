@@ -3,15 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>BitPlay - Stream Torrents Inside the Browser</title>
+    <title>BytePlay — Your video, ready to stream</title>
     <meta
       name="description"
-      content="BitPlay is a web-based torrent streaming application that allows you to stream torrents directly in your browser."
+      content="BytePlay streams your selected torrent video through your browser."
     />
-    <link rel="icon" href="assets/favicon.png" type="image/png" />
+    <link rel="icon" href="assets/byteplay-mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/video-js.min.css" />
     <link rel="stylesheet" href="assets/butterup.min.css" />
     <link rel="stylesheet" href="assets/output.css" />
+    <link rel="stylesheet" href="assets/byteplay.css" />
     <script>
       // set theme mode
       if (localStorage.getItem("theme") === "dark") {
@@ -34,8 +35,107 @@
     </script>
   </head>
 
-  <body>
-    <main
+  <body class="bp-theme">
+    <div id="bp-app" class="bp-shell">
+      <header class="bp-header">
+        <a class="bp-brand" href="/" id="bp-home-link" aria-label="BytePlay home">
+          <span class="bp-symbol" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M9 7h12l12 13-12 13H9V7Z" stroke="currentColor" stroke-width="2"/><path d="m18 13 10 7-10 7V13Z" fill="currentColor"/></svg></span>
+          <span>Byte<span class="bp-brand-accent">Play</span></span>
+        </a>
+        <nav class="bp-nav" aria-label="Main navigation">
+          <a href="#bp-how" id="bp-how-link">How it works</a>
+          <a href="#bp-features" id="bp-feature-link">Features</a>
+          <a href="#bp-played" id="bp-played-link">Played</a>
+          <button type="button" id="bp-settings" class="bp-outline">Settings <span aria-hidden="true">⚙</span></button>
+        </nav>
+      </header>
+      <main id="bp-home" class="bp-home">
+        <section class="bp-hero" aria-labelledby="bp-hero-title">
+          <div class="bp-eyebrow"><span class="bp-dot" aria-hidden="true"></span> STREAM FROM TORRENTS</div>
+          <h1 id="bp-hero-title">Your video,<br><span>ready to stream.</span></h1>
+          <p class="bp-lead">Open a magnet link or torrent file. BytePlay buffers the parts you need and plays through your browser.</p>
+          <form id="bp-open-form" class="bp-source-form" novalidate>
+            <label for="bp-magnet">Magnet link or infohash</label>
+            <div class="bp-field"><span aria-hidden="true">↗</span><input id="bp-magnet" type="text" autocomplete="off" spellcheck="false" placeholder="Paste a magnet link or 40-character infohash" required><button id="bp-paste" type="button" class="bp-ghost">Paste</button></div>
+            <button type="submit" class="bp-primary" id="bp-open">Open video <span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="bp-divider-text">or choose a .torrent file</div>
+          <div class="bp-drop" id="bp-drop">
+            <input id="bp-torrent-file" type="file" accept=".torrent,application/x-bittorrent" aria-label="Choose torrent file">
+            <span aria-hidden="true" class="bp-drop-icon">⇧</span>
+            <strong>Choose torrent file</strong>
+            <span>Drag and drop or browse your files</span>
+            <small>10 MB max metadata file</small>
+          </div>
+          <p class="bp-inline-error" id="bp-home-error" role="alert" hidden></p>
+          <p class="bp-trust"><span aria-hidden="true">●</span> Runs on your BytePlay server <span aria-hidden="true">·</span> Streaming uses available peers</p>
+        </section>
+        <section class="bp-search" id="bp-search-area" hidden>
+          <div class="bp-section-heading"><span class="bp-eyebrow">CONNECTED INDEXER</span><h2>Search your configured provider</h2></div>
+          <form id="bp-search-form" class="bp-search-form"><label for="bp-query" class="bp-visually-hidden">Search indexer</label><input id="bp-query" type="search" placeholder="Search your connected indexer"><button type="submit" class="bp-secondary">Search</button></form>
+          <p id="bp-search-message" role="status"></p>
+          <div id="bp-results" class="bp-results"></div>
+        </section>
+        <section class="bp-played" id="bp-played" aria-labelledby="bp-played-title">
+          <div class="bp-played-heading">
+            <div class="bp-section-heading"><span class="bp-eyebrow">YOUR BROWSER</span><h2 id="bp-played-title">Played videos</h2><p>Continue where you left off or replay from the beginning. Only this browser stores your magnet links, filenames and playback positions.</p></div>
+            <button type="button" id="bp-played-clear" class="bp-secondary" hidden>Clear history</button>
+          </div>
+          <p id="bp-played-empty" class="bp-played-empty">Videos you actually play will appear here. Nothing is sent to another account or sync service.</p>
+          <div id="bp-played-list" class="bp-played-list" aria-live="polite"></div>
+          <p id="bp-played-error" class="bp-inline-error" role="alert" hidden></p>
+        </section>
+        <section class="bp-steps" id="bp-how" aria-labelledby="bp-how-title">
+          <div class="bp-section-heading"><span class="bp-eyebrow">SIMPLE BY DESIGN</span><h2 id="bp-how-title">From link to playback</h2></div>
+          <div class="bp-steps-grid" id="bp-features">
+            <article><span class="bp-step-number">01</span><h3>Bring your torrent</h3><p>Paste a magnet or choose your own .torrent metadata file.</p></article>
+            <article><span class="bp-step-number">02</span><h3>Buffer what matters</h3><p>BytePlay requests pieces near your playback position.</p></article>
+            <article><span class="bp-step-number">03</span><h3>Watch in the browser</h3><p>HLS playback starts when two finalized segments are available.</p></article>
+          </div>
+        </section>
+      </main>
+      <main id="bp-watch" class="bp-watch" hidden>
+        <div class="bp-watch-top">
+          <button type="button" id="bp-new" class="bp-back">← New torrent</button>
+          <span class="bp-watch-tag">STREAM SESSION</span>
+        </div>
+        <div class="bp-status-strip" role="status" aria-live="polite">
+          <div class="bp-state"><span class="bp-dot" aria-hidden="true"></span><span id="bp-stage">Connecting to peers</span></div>
+          <div class="bp-fact">Peers <strong id="bp-peers">—</strong></div>
+          <div class="bp-fact">Download <strong id="bp-speed">—</strong></div>
+          <div class="bp-fact">File buffered <strong id="bp-progress">—</strong></div>
+        </div>
+        <div class="bp-watch-heading">
+          <div class="bp-title-block"><div class="bp-eyebrow">NOW STREAMING</div><h1 id="bp-title">Selected video</h1><p id="bp-subtitle">Preparing your stream</p></div>
+          <div class="bp-file-choice"><label for="bp-video-select">Video file</label><select id="bp-video-select" aria-label="Select video file"></select></div>
+        </div>
+        <div class="bp-actions">
+          <span class="bp-active-action" aria-current="page">▶ Stream</span>
+          <a id="bp-download" class="bp-action" href="#" download>↓ Download original</a>
+          <button id="bp-info-toggle" type="button" class="bp-action">ⓘ File info</button>
+          <button id="bp-retry" type="button" class="bp-action" hidden>↻ Retry</button>
+        </div>
+        <section class="bp-player-frame" aria-label="Video player">
+          <div class="bp-player-surface"><video id="bp-video" class="video-js vjs-big-play-centered" playsinline controls preload="auto" aria-label="BytePlay video player"></video></div>
+          <div id="bp-player-overlay" class="bp-player-overlay" role="status"><span class="bp-spinner" aria-hidden="true"></span><h2 id="bp-overlay-title">Preparing stream</h2><p id="bp-overlay-detail">Retrieving metadata from available peers.</p></div>
+        </section>
+        <div class="bp-timeline" id="bp-timeline" hidden>
+          <label for="bp-seek">Full video timeline <output id="bp-time">00:00 / —</output></label>
+          <input type="range" id="bp-seek" min="0" max="100" value="0" step="1" aria-label="Seek absolute video time">
+        </div>
+        <div class="bp-watch-bottom">
+          <div class="bp-playback-details"><strong id="bp-player-state">Preparing HLS</strong><p id="bp-player-detail">The player will start when the stream is ready.</p></div>
+          <div class="bp-watch-tools"><div id="bp-audio-wrap" hidden><label for="bp-audio">Audio track</label><select id="bp-audio"></select></div><label class="bp-subtitle-btn" for="bp-captions">＋ Add subtitles</label><input type="file" id="bp-captions" accept=".srt,.vtt" class="bp-visually-hidden"></div>
+        </div>
+        <p class="bp-inline-error" id="bp-watch-error" role="alert" hidden></p>
+        <aside class="bp-info" id="bp-info" hidden aria-label="File information">
+          <div class="bp-info-top"><h2>File information</h2><button type="button" id="bp-close-info" aria-label="Close file information">✕</button></div>
+          <dl id="bp-info-list"></dl>
+        </aside>
+      </main>
+      <footer class="bp-footer"><span>BytePlay · Stream from your own torrent sources</span><span>Data and cache are handled by your BytePlay server.</span></footer>
+    </div>
+    <main hidden id="legacy-main"
       class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-10 flex flex-col items-center"
     >
       <div class="flex justify-between w-full gap-4 mb-8 md:mb-15">
@@ -379,7 +479,7 @@
           </label>
           <div class="flex flex-col gap-2">
             <label
-              for="proxy"
+              for="proxyUrl"
               class="text-muted-foreground text-sm font-semibold"
               >Enter a SOCKS5 Proxy URL
             </label>
@@ -389,6 +489,7 @@
               placeholder="socks5://username:password@host:port"
               class="file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground dark:bg-input/30 border-input flex w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive h-10 pr-12 overflow-ellipsis overflow-hidden"
             />
+            <p class="text-xs text-muted-foreground" role="note">SOCKS5 is best-effort for supported HTTP traffic. Torrent peer/tracker isolation is not verified. Use a network-namespace VPN for fail-closed egress.</p>
           </div>
           <div id="proxy-result" class="hidden items-center gap-2">
             <span class="text-muted-foreground">IP Address:</span
@@ -642,6 +743,16 @@
           </div>
         </form>
         <div class="tab flex flex-col gap-6 hidden" data-tab="3">
+          <form id="bp-startup-cache-form" class="flex flex-col gap-2">
+            <label for="bp-startup-cache-percent" class="text-sm font-semibold">Minimum selected-video cache before playback (%)</label>
+            <p class="text-sm text-muted-foreground">Default: 9%. Download this fraction of the selected video before playback. 0% disables the extra wait. Larger files may need more time or cache space.</p>
+            <div class="flex items-center gap-3">
+              <input type="number" min="0" max="100" step="1" required id="bp-startup-cache-percent" value="9"
+                class="w-24 rounded-md border bg-muted px-3 py-2" />
+              <button class="btn !h-11" type="submit" id="bp-startup-cache-save">Save playback setting</button>
+            </div>
+            <p id="bp-startup-cache-feedback" role="status" aria-live="polite" class="text-sm text-muted-foreground"></p>
+          </form>
           <div class="flex flex-col gap-2">
             <div class="flex items-center justify-between">
               <span class="text-muted-foreground text-sm font-semibold"
@@ -700,6 +811,8 @@ No logs yet</pre
     <script src="assets/video.min.js"></script>
     <script src="assets/videojs.hotkeys.min.js"></script>
     <script src="assets/butterup.min.js"></script>
+    <script src="assets/player-timeline.js"></script>
     <script type="module" src="assets/index.js"></script>
+    <script type="module" src="assets/byteplay-app.js"></script>
   </body>
 </html>
